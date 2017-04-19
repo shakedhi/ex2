@@ -1,0 +1,271 @@
+---
+title: "Titanic"
+author: "Assaf & Shaked"
+date: "April, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, root.dir='DS2017B/Titanic')
+library(mice)
+library(caret)
+library(rpart)
+library(nnet)
+library(randomForest)
+```
+
+# The data 
+
+### Loading the data
+
+```{r}
+train <- read.csv('train.csv', na.strings="")
+test <- read.csv('test.csv', na.strings="")
+```
+
+### Filtering the data columns
+
+First, we will save the test set PassengerId columns, that will be used for generating the final result. Then, we will mark categorical columns as factors. Finally, we will remove the useless columns.
+
+```{r}
+test_ids <- test$PassengerId
+
+train$Survived<- as.factor(train$Survived)
+train$Pclass<- as.factor(train$Pclass)
+train <- train[,-c(1,9,11)]  # ignore mostly useless columns (PassengerId, Ticket, Cabin)
+
+test$Pclass<- as.factor(test$Pclass)
+test <- test[,-c(1,8,10)]  # ignore mostly useless columns (PassengerId, Ticket, Cabin)
+```
+
+### Combining the data
+
+We'll save the number of records for both the train set and test set, and then we will merge them, so the data preparation will be better and easier.
+
+```{r}
+ntrain <- nrow(train)
+ntest <- nrow(test)
+
+all <- rbind(train[,-1], test)
+```
+
+# Data Preprocessing
+
+### Fix missing Embarked field
+
+First, we will see what are the indices of the records with the missing Embraked fields.
+
+```{r}
+subset(all, is.na(Embarked))
+```
+
+Now, we can see that there are two records with the Embarked field empty, no. **62** and no. **830**.  
+We can also see that both records' **Pclass is 1** and **Fare is $80**.  
+We will try to guess where they embarked, based on the data we have on them and the data we have on everyone else. In order to do so, we will plot the relationship between the Fare price, Pclass and Embarked.
+
+```{r}
+fare_embarked <- subset(all, !is.na(Embarked))
+boxplot(Fare ~ Pclass + Embarked, data=fare_embarked)
+```
+
+We can see in the box plot that passengers who paid $80 and their Pclass is 1 are more likely to be embarked from C. So, we will add 'C' for the two Embarked missing records.
+
+```{r}
+all$Embarked[c(62, 830)] <- 'C'
+```
+
+### Fix missing Fare field
+
+First, we will see what are the indices of the records with the missing Fare fields.
+
+```{r}
+subset(all, is.na(Fare))
+```
+
+We can see that we have one records with empty Fare value, and he embarked from **S** and his Pclass is **3**.  
+Now, from the in the box plot above, we can take the median value of the passengers embarked from the same place and are in the same Pclass.
+
+```{r}
+all$Fare[1044] <- median(subset(all, Pclass == '3' & Embarked == 'S' & !is.na(Fare))$Fare)
+```
+
+### Add total family members
+
+First, we will add a new column marking the size of the family each passenger came with. We suspect that the number of family members is tied with the chances of survival (For example, we think that for large families, the chances that every family member survived is smaller than in smaller families).
+
+```{r}
+all$Family <- apply(all[,c(5,6)], 1, function(x) sum(x) + 1)
+```
+
+Now, we will plot the number of survivals in each family size (of course, using only the train set).
+
+```{r}
+barplot(table(train$Survived, all[1:ntrain,]$Family), main='Survived by family size', xlab='Number of family members', beside=TRUE, col=c('red', 'darkgreen'), legend=c('Didn\'t survived', 'Survived'))
+```
+
+We can see that families with **2 to 4** members, had better chances of survival.
+Also, we can see that passengers that came alone were the majority and most of them did not survived, and as we suspected, larger families (with 5 or more members), had very low chances of survival.  
+Hence, we will make the family size column categorical, by marking families with 1 passenger as **S** (Small), families with 2 to 4 passengers as **M** (Medium), and families with 5 or more passengers as **L** (Large).
+
+```{r}
+family_members_to_size <- function (x) {
+  if (x < 2)
+    return('S')
+  else if (x >= 2 & x <= 4)
+    return('M')
+  else 
+    return('L')
+}
+
+all$Family <- sapply(all$Family, family_members_to_size)
+all$Family <- as.factor(all$Family)
+```
+
+### Add social status
+
+Next, we'll extract the social status of the passengers, based on their names. We can see that their names are in the following format: **Last_Name, Title. First_Name**.  
+We assume that passengers with higher social status (such as Sir, Lord, etc.) had a better change for survival.
+
+```{r}
+all$Status <- apply(all[2], 1, function(x) strsplit(strsplit(x, ", ")[[1]][2], "\\. ")[[1]][1])
+statuses <- unique(all$Status)
+print(statuses)
+```
+
+We can see that there are many different titles. With a little search over the internet, we found that the titles 'Mlle' and 'Miss' are quite similar to 'Ms'. Also, 'Mme' which is short for Maddame is quite similar to 'Mrs'.  
+There are some rare titles in the passenger list, we'll mark them together as a title named 'Honorific'.
+
+```{r}
+all$Status[all$Status == 'Miss' | all$Status == 'Mlle'] <- 'Ms'
+all$Status[all$Status == 'Mme'] <- 'Mrs'
+for(i in 1:length(statuses)){
+  if(length(all$Status[all$Status == statuses[i]]) <= 10)
+    all$Status[all$Status == statuses[i]] <- 'Honorific'
+}
+print(unique(all$Status))
+all$Status<- as.factor(all$Status)
+```
+
+### Fix missing Age records
+
+```{r}
+str(subset(all, is.na(Age)))
+```
+
+We can see there are 263 records where the Age is empty. Age is harder to guess based on existing records. Hence, we will use package called mice that provides multivarient imputation and will help us to fill the empty Age data based on other records. This time we will ignore the Name, Sex and Embarked fields, as they cannot tell us any valuable information about the Age.
+
+```{r}
+all_new <- mice(all[, -c(2,3,8)], method='rf', seed=2) # Filter Name, Sex and Embarked
+all_new <- complete(all_new)
+```
+
+We'll draw now two histograms in order to see that the new Age column is keeping the same characteristics as the original. Finally, we will write the new Age column.
+
+```{r}
+par(mfrow=c(1,2))
+hist(all$Age, main='Real Age', xlab='Age', col='blue', freq=FALSE, ylim=c(0,0.04))
+hist(all_new$Age, main='Imputed Age', xlab='Age', col='blue', freq=FALSE, ylim=c(0,0.04))
+all$Age <- all_new$Age
+```
+
+# Model Training and Predicting
+
+### Filtering the Name field from the final dataset
+
+After the social status extraction, the name is not needed anymore.
+
+```{r}
+filtered <- all[, -2]
+str(filtered)
+```
+
+### Spliting the data
+
+Now, we'll split the data again to the same train set and train set as before, but with the new data after the preprocessing.
+
+```{r}
+new_train <- filtered[1:ntrain,]
+new_train$Survived <- train$Survived
+new_test <- filtered[seq(1+ntrain, ntest+ntrain),]
+str(new_train)
+```
+
+### Model training
+
+We are going to train 3 different classification models:  
+1. **Decision Tree Classifier** - this is a basic classification model that looks like a tree, and in each node of the tree it decides based on the features values which node to go next. It continues to do so until it reaches a child node and decides it's prediction based on it.  
+2. **Random Forest Classifier** - this is an ensamble classification model that creates and trains a specified amount of *Decision trees*, and then returns a result that is based on the majority of those trees results. However, unlike regular *Decision trees*, there is randomness in the feature selection at each node. That means, that in each node in each tree, m out of M features are selected randomly, and based on the the tree will decide how to split the data. Since the trees are quite large, it mostly ensures that every feature is used at least once, in each tree.  
+3. **Neural Network Classifier** - this is a more complex classification model that is based on the idea of how our *neurons* in our brain works. It consists of an input layer, a given amount of hidden layers and an output layer.   
+We will use **5-fold cross-validation** and our measurement will be **Accuracy**.  
+Also, we will use the *expand.grid* method for the parameter tuning, of the tunable parameters of each model.
+
+```{r}
+# define trainControl for 5-fold Cross-Validation
+tc <- trainControl(method="cv",number=5)
+
+# train Decision Tree model (Basic)
+set.seed(123)
+dt <- train(Survived~., data=new_train, method="rpart", trControl=tc)
+
+# train Random Forest model (Ensemble)
+set.seed(144)
+rf <- train(Survived~., data=new_train, method="rf", trControl=tc,
+            ntree=1000, tuneGrid=expand.grid(mtry=seq(2,14,3)))
+
+# train Neural Network model 
+set.seed(123)
+nn <- train(Survived~., data=new_train, method="nnet", trControl=tc,
+            tuneGrid=expand.grid(size=seq(3,7,1), decay=seq(0.1,0.5,0.2)), trace=FALSE)
+```
+
+### Examine the parameter tuning for Random Forest model
+
+As we can see in the plot below, we are getting the best Accurracy when the *mtry* parameter is equal to **2**. That means that in each node, 2 out of all possible features are randomly selected, and based on them it will decide how to split the data.  
+We can also see that the Accuracy is quite bad when too many predictors are used.
+
+```{r}
+plot(rf, xlab="Randomly selected predictors")
+```
+
+### Examine the parameter tuning for Neural Network model
+
+As we can see in the plot below, we are getting the best Accurracy when the *size* parameter is equal to **3** and the *decay* parameter is **0.5**. We can see that each time we used weight decay of 0.5, the accuracy was better then when it was 0.3 (and the same goes with 0.3 and 0.1) even when we used more hidden layers.  
+Also, it means that the Neural Network model will have 3 hidden layers, or 5 layers in total - 1 input layer, 3 hidden layers in the middle, and 1 output layer.
+
+```{r}
+plot(nn, xlab="Number of hidden layers")
+```
+
+### Prediction
+
+Now we'll get the prediction results from each of the 3 models, on the given test set.
+
+```{r}
+pred_dt <- predict(dt, new_test, type="raw")
+pred_rf <- predict(rf, new_test)
+pred_nn <- predict(nn, new_test)
+```
+
+### Saving the results
+
+And of course, we'll save the result of each model in a csv file, with distinguishable names.  
+These will be submitted to Kaggle and below we'll examine those results.
+
+```{r}
+res_dt <- cbind(PassengerId=test_ids, Survived=as.character(pred_dt))
+write.csv(res_dt, file="result_dt.csv", row.names=FALSE)
+res_rf <- cbind(PassengerId=test_ids, Survived=as.character(pred_rf))
+write.csv(res_rf, file="result_rf.csv", row.names=FALSE)
+res_nn <- cbind(PassengerId=test_ids, Survived=as.character(pred_nn))
+write.csv(res_nn, file="result_nn.csv", row.names=FALSE)
+```
+
+# Kaggle Results
+
+Decision tree result is **0.78947** (result file can be seen [here](https://github.com/shakedhi/ex2/blob/master/result_dt.csv)):  ![](dt.png)
+  
+Random forest result is **0.80861** (result file can be seen [here](https://github.com/shakedhi/ex2/blob/master/result_rf.csv)):  ![](rf.png)
+  
+Neural Network result is **0.79904** (result file can be seen [here](https://github.com/shakedhi/ex2/blob/master/result_nn.csv)):  ![](nn.png)
+
+As we can see, we got the best result using the Random Forest model, which put our user (username: [shakedhi](https://www.kaggle.com/shakedhi)) in the **553rd** place.  
